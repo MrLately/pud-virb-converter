@@ -1,0 +1,2 @@
+garmin-fit-sdk==21.208.0
+pyinstaller==6.18.0
