@@ -71,6 +71,53 @@ class ConverterTests(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertEqual(len(messages.get("record_mesgs", [])), 3)
 
+    def test_invalid_product_gps_skips_without_controller_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "controller-fallback.pud"
+            input_path.write_bytes(
+                make_pud_with_controller(
+                    [
+                        (0, True, -81.0, 41.0, 0.0, 0.0, 100_000),
+                        (1000, False, 500.0, 500.0, -10.0, 10.0, 101_000),
+                        (2000, True, -80.999, 41.0, -10.0, 10.0, 102_000),
+                    ]
+                )
+            )
+            result = convert_file(input_path, Path(tmp) / "out")
+            self.assertEqual(len(result.rows), 2)
+            self.assertEqual(result.skipped_rows, 1)
+            self.assertLess(result.rows[-1].distance_m, 100)
+            self.assertTrue(all(row.position_source == "product" for row in result.rows))
+            self.assertTrue(any("controller GPS was not used" in warning for warning in result.warnings))
+            csv_text = result.csv_path.read_text(encoding="utf-8")
+            self.assertIn("controller_gps_latitude", csv_text)
+
+    def test_altitude_is_scaled_from_millimeters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "altitude.pud"
+            input_path.write_bytes(make_pud([(0, True, -81.0, 41.0, 0.0, 0.0, 0.0, 151_004, 97)]))
+            result = convert_file(input_path, Path(tmp) / "out")
+            self.assertAlmostEqual(result.rows[0].altitude_m or 0.0, 151.004, places=3)
+            self.assertTrue(any("Scaled altitude" in warning for warning in result.warnings))
+
+    def test_duplicate_timestamps_keep_latest_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "duplicates.pud"
+            input_path.write_bytes(
+                make_pud(
+                    [
+                        (0, True, -81.0, 41.0, 0.0, 0.0, 0.0, 100_000, 97),
+                        (0, True, -80.999, 41.0, 0.0, 0.0, 0.0, 151_004, 96),
+                        (1000, True, -80.998, 41.0, 0.0, 0.0, 0.0, 152_000, 95),
+                    ]
+                )
+            )
+            result = convert_file(input_path, Path(tmp) / "out")
+            self.assertEqual(len(result.rows), 2)
+            self.assertAlmostEqual(result.rows[0].longitude, -80.999)
+            self.assertAlmostEqual(result.rows[0].altitude_m or 0.0, 151.004, places=3)
+            self.assertTrue(any("Deduplicated 1 row" in warning for warning in result.warnings))
+
     def test_long_flight_exceeds_65km_and_100min(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             input_path = Path(tmp) / "long.json.gz"
@@ -132,6 +179,37 @@ def make_pud(rows: list[tuple[int, bool, float, float, float, float, float, int,
         binary.extend(struct.pack("<f", vz))
         binary.extend(struct.pack("<i", altitude))
         binary.extend(int(battery).to_bytes(1, "little", signed=True))
+    return json.dumps(header).encode("utf-8") + b"\x00" + bytes(binary)
+
+
+def make_pud_with_controller(rows: list[tuple[int, bool, float, float, float, float, int]]) -> bytes:
+    header = {
+        "version": "1",
+        "software_version": "5.2.7",
+        "hardware_version": "Disco",
+        "uuid": "SYNTHETIC",
+        "product_name": "Disco",
+        "product_id": 42,
+        "date": "2026-05-27T134941-0400",
+        "details_headers": [
+            {"name": "time", "type": "integer", "size": 4},
+            {"name": "product_gps_available", "type": "boolean", "size": 1},
+            {"name": "product_gps_longitude", "type": "double", "size": 8},
+            {"name": "product_gps_latitude", "type": "double", "size": 8},
+            {"name": "controller_gps_longitude", "type": "double", "size": 8},
+            {"name": "controller_gps_latitude", "type": "double", "size": 8},
+            {"name": "altitude", "type": "integer", "size": 4},
+        ],
+    }
+    binary = bytearray()
+    for time_ms, gps_ok, product_lon, product_lat, controller_lon, controller_lat, altitude in rows:
+        binary.extend(struct.pack("<i", time_ms))
+        binary.extend(b"\x01" if gps_ok else b"\x00")
+        binary.extend(struct.pack("<d", product_lon))
+        binary.extend(struct.pack("<d", product_lat))
+        binary.extend(struct.pack("<d", controller_lon))
+        binary.extend(struct.pack("<d", controller_lat))
+        binary.extend(struct.pack("<i", altitude))
     return json.dumps(header).encode("utf-8") + b"\x00" + bytes(binary)
 
 

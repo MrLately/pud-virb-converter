@@ -14,8 +14,6 @@ CORE_FIELDS = {
     "product_gps_available",
     "product_gps_longitude",
     "product_gps_latitude",
-    "controller_gps_longitude",
-    "controller_gps_latitude",
     "altitude",
     "speed",
 }
@@ -26,10 +24,16 @@ def normalize_flight(parsed: ParsedFlight, offset_seconds: float = 0.0) -> tuple
     start_time = _parse_start_time(parsed.metadata.get("date"), warnings)
     rows: list[TelemetryRow] = []
     skipped = 0
-    fallback_warned = False
     previous: TelemetryRow | None = None
+    invalid_product_gps = 0
+    altitude_scaled = 0
+    raw_rows, duplicate_count = _dedupe_rows_by_time(parsed.raw_rows)
+    if duplicate_count:
+        warnings.append(
+            f"Deduplicated {duplicate_count} row(s) with duplicate time_ms values; kept the latest row for each timestamp"
+        )
 
-    for raw in parsed.raw_rows:
+    for raw in raw_rows:
         time_ms = _coerce_int(raw.get("time"))
         if time_ms is None:
             skipped += 1
@@ -37,15 +41,15 @@ def normalize_flight(parsed: ParsedFlight, offset_seconds: float = 0.0) -> tuple
 
         position = _pick_position(raw)
         if position is None:
+            invalid_product_gps += 1
             skipped += 1
             continue
-        lat, lon, position_source = position
-        if position_source == "controller" and not fallback_warned:
-            warnings.append("Falling back to controller GPS for at least one row because product GPS was unavailable")
-            fallback_warned = True
+        lat, lon = position
 
         timestamp = start_time + timedelta(milliseconds=time_ms, seconds=offset_seconds)
-        altitude = _coerce_float(raw.get("altitude"))
+        altitude, scaled = _altitude_m(raw.get("altitude"))
+        if scaled:
+            altitude_scaled += 1
         speed = _coerce_float(raw.get("speed"))
         if speed is None:
             speed = _vector_speed(raw)
@@ -69,12 +73,18 @@ def normalize_flight(parsed: ParsedFlight, offset_seconds: float = 0.0) -> tuple
             altitude_m=altitude,
             speed_m_s=speed,
             distance_m=distance,
-            position_source=position_source,
+            position_source="product",
             extras=extras,
         )
         rows.append(row)
         previous = row
 
+    if invalid_product_gps:
+        warnings.append(
+            f"Skipped {invalid_product_gps} row(s) with invalid or unavailable product GPS; controller GPS was not used for the aircraft route"
+        )
+    if altitude_scaled:
+        warnings.append(f"Scaled altitude from Parrot millimeters to meters for {altitude_scaled} row(s)")
     if not rows:
         warnings.append("No rows with valid timestamps and GPS coordinates were found")
     return rows, warnings, skipped
@@ -126,20 +136,37 @@ def _parse_start_time(value: Any, warnings: list[str]) -> datetime:
         return datetime.now(timezone.utc).replace(microsecond=0)
 
 
-def _pick_position(raw: dict[str, Any]) -> tuple[float, float, str] | None:
+def _dedupe_rows_by_time(raw_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    latest_by_time: dict[int, dict[str, Any]] = {}
+    untimed_rows: list[dict[str, Any]] = []
+    duplicate_count = 0
+    for raw in raw_rows:
+        time_ms = _coerce_int(raw.get("time"))
+        if time_ms is None:
+            untimed_rows.append(raw)
+            continue
+        if time_ms in latest_by_time:
+            duplicate_count += 1
+        latest_by_time[time_ms] = raw
+    return [latest_by_time[time_ms] for time_ms in sorted(latest_by_time)] + untimed_rows, duplicate_count
+
+
+def _pick_position(raw: dict[str, Any]) -> tuple[float, float] | None:
     product_available = raw.get("product_gps_available")
     product_lat = _coerce_float(raw.get("product_gps_latitude"))
     product_lon = _coerce_float(raw.get("product_gps_longitude"))
-    if (product_available is True or product_available is None) and _valid_coord(product_lat, product_lon):
-        return product_lat, product_lon, "product"
+    if product_available is False:
+        return None
     if _valid_coord(product_lat, product_lon):
-        return product_lat, product_lon, "product"
-
-    controller_lat = _coerce_float(raw.get("controller_gps_latitude"))
-    controller_lon = _coerce_float(raw.get("controller_gps_longitude"))
-    if _valid_coord(controller_lat, controller_lon):
-        return controller_lat, controller_lon, "controller"
+        return product_lat, product_lon
     return None
+
+
+def _altitude_m(value: Any) -> tuple[float | None, bool]:
+    altitude = _coerce_float(value)
+    if altitude is None:
+        return None, False
+    return altitude / 1000.0, True
 
 
 def _valid_coord(lat: float | None, lon: float | None) -> bool:
