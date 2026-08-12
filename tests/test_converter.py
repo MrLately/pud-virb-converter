@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 import struct
 import tempfile
 import unittest
@@ -70,6 +71,80 @@ class ConverterTests(unittest.TestCase):
             messages, errors = Decoder(Stream.from_file(str(result.fit_path))).read()
             self.assertEqual(errors, [])
             self.assertEqual(len(messages.get("record_mesgs", [])), 3)
+
+    def test_fdm_fit_carrier_fields_are_written(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "fdm-fields.pud"
+            input_path.write_bytes(
+                make_fdm_pud(
+                    [
+                        (0, -81.0, 41.0, 3.0, 4.0, 12.0, 11.4, 0.1, 0.2, -1.0, 151_004, 87, -42, 13),
+                        (1000, -80.999, 41.0, 6.0, 8.0, 0.0, 12.2, 0.3, 0.4, 1.2, 152_000, 86, -41, 14),
+                    ]
+                )
+            )
+            result = convert_file(input_path, Path(tmp) / "out")
+            messages, errors = Decoder(Stream.from_file(str(result.fit_path))).read()
+            self.assertEqual(errors, [])
+
+            first_record = messages["record_mesgs"][0]
+            self.assertEqual(first_record["activity_type"], "cycling")
+            self.assertEqual(first_record["cadence"], 87)
+            self.assertEqual(first_record["heart_rate"], 42)
+            self.assertEqual(first_record["vertical_oscillation"], 130.0)
+            self.assertAlmostEqual(first_record["stance_time"], 46.8, places=1)
+            self.assertAlmostEqual(first_record["stance_time_percent"], 151.0, places=1)
+
+            attitude = messages.get("aviation_attitude_mesgs", [])
+            self.assertGreaterEqual(len(attitude), 1)
+            self.assertAlmostEqual(as_list(attitude[0]["pitch"])[0], 0.2, places=3)
+            self.assertAlmostEqual(as_list(attitude[0]["roll"])[0], 0.1, places=3)
+            self.assertAlmostEqual(as_list(attitude[0]["track"])[0], (math.pi * 2.0) - 1.0, places=3)
+
+            obd_pids = {message["pid"] for message in messages.get("obdii_data_mesgs", [])}
+            self.assertEqual({12, 13, 94}, obd_pids)
+
+            csv_text = result.csv_path.read_text(encoding="utf-8")
+            self.assertIn("fdm_obd_pid13_pitot_kmh", csv_text)
+            manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(manifest["fdm_compatibility"]["enabled"])
+
+    def test_long_fdm_compat_distance_saturates_legacy_fields_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "long-fdm.pud"
+            rows = []
+            for index in range(1001):
+                rows.append(
+                    (
+                        index * 1000,
+                        -81.0 + index * 0.001,
+                        41.0,
+                        20.0,
+                        0.0,
+                        0.0,
+                        18.0,
+                        0.0,
+                        0.1,
+                        0.2,
+                        100_000,
+                        90,
+                        -30,
+                        16,
+                    )
+                )
+            input_path.write_bytes(make_fdm_pud(rows))
+            result = convert_file(input_path, Path(tmp) / "out")
+            messages, errors = Decoder(Stream.from_file(str(result.fit_path))).read()
+            self.assertEqual(errors, [])
+            records = messages["record_mesgs"]
+            self.assertGreater(records[-1]["distance"], 75_000)
+            self.assertEqual(records[-1]["power"], 65_534)
+
+            pid12_messages = [message for message in messages["obdii_data_mesgs"] if message["pid"] == 12]
+            self.assertGreater(len(pid12_messages), 0)
+            self.assertEqual(pid12_messages[-1]["raw_data"], [255, 254])
+            self.assertTrue(any("power-as-distance" in warning for warning in result.warnings))
+            self.assertTrue(any("PID 12 distance-from-home" in warning for warning in result.warnings))
 
     def test_invalid_product_gps_skips_without_controller_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -211,6 +286,57 @@ def make_pud_with_controller(rows: list[tuple[int, bool, float, float, float, fl
         binary.extend(struct.pack("<d", controller_lat))
         binary.extend(struct.pack("<i", altitude))
     return json.dumps(header).encode("utf-8") + b"\x00" + bytes(binary)
+
+
+def make_fdm_pud(rows: list[tuple[int, float, float, float, float, float, float, float, float, float, int, int, int, int]]) -> bytes:
+    header = {
+        "version": "1",
+        "software_version": "5.2.7",
+        "hardware_version": "Disco",
+        "uuid": "FDMCOMPAT",
+        "product_name": "Disco",
+        "product_id": 42,
+        "date": "2026-05-27T134941-0400",
+        "details_headers": [
+            {"name": "time", "type": "integer", "size": 4},
+            {"name": "battery_level", "type": "integer", "size": 4},
+            {"name": "wifi_signal", "type": "integer", "size": 2},
+            {"name": "product_gps_available", "type": "boolean", "size": 1},
+            {"name": "product_gps_longitude", "type": "double", "size": 8},
+            {"name": "product_gps_latitude", "type": "double", "size": 8},
+            {"name": "product_gps_sv_number", "type": "integer", "size": 1},
+            {"name": "speed_vx", "type": "float", "size": 4},
+            {"name": "speed_vy", "type": "float", "size": 4},
+            {"name": "speed_vz", "type": "float", "size": 4},
+            {"name": "pitot_speed", "type": "float", "size": 4},
+            {"name": "angle_phi", "type": "float", "size": 4},
+            {"name": "angle_theta", "type": "float", "size": 4},
+            {"name": "angle_psi", "type": "float", "size": 4},
+            {"name": "altitude", "type": "integer", "size": 4},
+        ],
+    }
+    binary = bytearray()
+    for time_ms, lon, lat, vx, vy, vz, pitot, phi, theta, psi, altitude, battery, wifi, satellites in rows:
+        binary.extend(struct.pack("<i", time_ms))
+        binary.extend(struct.pack("<i", battery))
+        binary.extend(struct.pack("<h", wifi))
+        binary.extend(b"\x01")
+        binary.extend(struct.pack("<d", lon))
+        binary.extend(struct.pack("<d", lat))
+        binary.extend(int(satellites).to_bytes(1, "little", signed=True))
+        binary.extend(struct.pack("<f", vx))
+        binary.extend(struct.pack("<f", vy))
+        binary.extend(struct.pack("<f", vz))
+        binary.extend(struct.pack("<f", pitot))
+        binary.extend(struct.pack("<f", phi))
+        binary.extend(struct.pack("<f", theta))
+        binary.extend(struct.pack("<f", psi))
+        binary.extend(struct.pack("<i", altitude))
+    return json.dumps(header).encode("utf-8") + b"\x00" + bytes(binary)
+
+
+def as_list(value):
+    return value if isinstance(value, list) else [value]
 
 
 def make_json_payload(point_count: int, seconds_step: int, lon_step: float) -> dict:

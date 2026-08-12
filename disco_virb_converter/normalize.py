@@ -25,6 +25,7 @@ def normalize_flight(parsed: ParsedFlight, offset_seconds: float = 0.0) -> tuple
     rows: list[TelemetryRow] = []
     skipped = 0
     previous: TelemetryRow | None = None
+    home_position: tuple[float, float] | None = None
     invalid_product_gps = 0
     altitude_scaled = 0
     raw_rows, duplicate_count = _dedupe_rows_by_time(parsed.raw_rows)
@@ -45,6 +46,8 @@ def normalize_flight(parsed: ParsedFlight, offset_seconds: float = 0.0) -> tuple
             skipped += 1
             continue
         lat, lon = position
+        if home_position is None:
+            home_position = (lat, lon)
 
         timestamp = start_time + timedelta(milliseconds=time_ms, seconds=offset_seconds)
         altitude, scaled = _altitude_m(raw.get("altitude"))
@@ -63,6 +66,7 @@ def normalize_flight(parsed: ParsedFlight, offset_seconds: float = 0.0) -> tuple
                 delta_s = (timestamp - previous.timestamp_utc).total_seconds()
                 if delta_s > 0:
                     speed = step / delta_s
+        distance_from_home = haversine_m(home_position[0], home_position[1], lat, lon) if home_position else None
 
         extras = {key: value for key, value in raw.items() if key not in CORE_FIELDS}
         row = TelemetryRow(
@@ -74,6 +78,7 @@ def normalize_flight(parsed: ParsedFlight, offset_seconds: float = 0.0) -> tuple
             speed_m_s=speed,
             distance_m=distance,
             position_source="product",
+            distance_from_home_m=distance_from_home,
             extras=extras,
         )
         rows.append(row)

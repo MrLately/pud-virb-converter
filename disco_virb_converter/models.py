@@ -27,6 +27,7 @@ class TelemetryRow:
     speed_m_s: float | None
     distance_m: float
     position_source: str
+    distance_from_home_m: float | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
 

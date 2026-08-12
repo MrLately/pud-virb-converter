@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import math
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -17,6 +17,12 @@ from disco_virb_converter.pud import load_flight
 GPX_NS = "http://www.topografix.com/GPX/1/1"
 GPXTPX_NS = "http://www.garmin.com/xmlschemas/TrackPointExtension/v2"
 XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
+FIT_EPOCH = datetime(1989, 12, 31, tzinfo=timezone.utc)
+LEGACY_POWER_DISTANCE_LIMIT_M = 65_534.0
+FDM_PID12_DISTANCE_LIMIT_M = 65_534.0 / 4.0
+OBD_PID_DISTANCE_FROM_HOME = 12
+OBD_PID_VEHICLE_SPEED = 13
+OBD_PID_ALTITUDE = 94
 
 
 def convert_file(input_path: str | Path, out_dir: str | Path | None = None, offset_seconds: float = 0.0) -> ConversionResult:
@@ -85,6 +91,16 @@ def write_csv(rows: list[TelemetryRow], path: Path) -> None:
         "distance_m",
         "distance_mi",
         "position_source",
+        "distance_from_home_m",
+        "fdm_cadence_battery",
+        "fdm_heart_rate_wifi_abs",
+        "fdm_vertical_oscillation_gps_sv_x10",
+        "fdm_stance_time_3d_speed_kmh",
+        "fdm_stance_time_percent_altitude_m",
+        "fdm_power_legacy_distance_m",
+        "fdm_obd_pid13_pitot_kmh",
+        "fdm_obd_pid94_altitude_m",
+        "fdm_obd_pid12_distance_from_home_m",
     ] + extra_keys
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
@@ -102,6 +118,16 @@ def write_csv(rows: list[TelemetryRow], path: Path) -> None:
                 "distance_m": f"{row.distance_m:.3f}",
                 "distance_mi": f"{row.distance_m / 1609.344:.6f}",
                 "position_source": row.position_source,
+                "distance_from_home_m": "" if row.distance_from_home_m is None else f"{row.distance_from_home_m:.3f}",
+                "fdm_cadence_battery": _csv_value(fdm_cadence(row)),
+                "fdm_heart_rate_wifi_abs": _csv_value(fdm_heart_rate(row)),
+                "fdm_vertical_oscillation_gps_sv_x10": _csv_value(fdm_vertical_oscillation(row)),
+                "fdm_stance_time_3d_speed_kmh": _csv_value(fdm_recorded_3d_speed_kmh(row), precision=3),
+                "fdm_stance_time_percent_altitude_m": _csv_value(fdm_altitude(row), precision=3),
+                "fdm_power_legacy_distance_m": _csv_value(fdm_legacy_power(row)),
+                "fdm_obd_pid13_pitot_kmh": _csv_value(fdm_pid13_vehicle_speed(row)),
+                "fdm_obd_pid94_altitude_m": _csv_value(fdm_altitude(row), precision=3),
+                "fdm_obd_pid12_distance_from_home_m": _csv_value(fdm_pid12_distance_from_home(row), precision=3),
             }
             for key in extra_keys:
                 value = row.extras.get(key)
@@ -162,6 +188,7 @@ def write_fit(rows: list[TelemetryRow], path: Path, metadata: dict[str, Any], na
     avg_speed = total_distance / duration_s if duration_s > 0 else (sum(speeds) / len(speeds) if speeds else 0.0)
     max_speed = max(speeds) if speeds else 0.0
     ascent, descent = total_ascent_descent(rows)
+    add_fdm_compat_warnings(rows, warnings)
 
     encoder.on_mesg(
         nums["FILE_ID"],
@@ -173,19 +200,21 @@ def write_fit(rows: list[TelemetryRow], path: Path, metadata: dict[str, Any], na
             "time_created": start,
         },
     )
+    encoder.on_mesg(nums["FILE_CREATOR"], {"software_version": 200, "hardware_version": 1})
+    encoder.on_mesg(
+        nums["TIMESTAMP_CORRELATION"],
+        {
+            "timestamp": start,
+            "system_timestamp": start,
+            "local_timestamp": fit_local_timestamp(start),
+        },
+    )
     encoder.on_mesg(nums["EVENT"], {"timestamp": start, "event": "timer", "event_type": "start"})
-    for row in rows:
-        record = {
-            "timestamp": row.timestamp_utc,
-            "position_lat": degrees_to_semicircles(row.latitude),
-            "position_long": degrees_to_semicircles(row.longitude),
-            "distance": row.distance_m,
-            "speed": fit_speed(row.speed_m_s),
-            "enhanced_speed": nonnegative(row.speed_m_s),
-            "altitude": fit_altitude(row.altitude_m),
-            "enhanced_altitude": fit_altitude(row.altitude_m),
-        }
-        encoder.on_mesg(nums["RECORD"], record)
+    for group in group_rows_by_second(rows):
+        for row in group:
+            write_fit_record(encoder, nums, row)
+        write_aviation_attitude(encoder, nums, group)
+        write_obdii_data(encoder, nums, group[-1])
     encoder.on_mesg(nums["EVENT"], {"timestamp": end, "event": "timer", "event_type": "stop_all"})
 
     common_summary = {
@@ -200,7 +229,7 @@ def write_fit(rows: list[TelemetryRow], path: Path, metadata: dict[str, Any], na
         "max_speed": fit_speed(max_speed),
         "total_ascent": ascent,
         "total_descent": descent,
-        "sport": "flying",
+        "sport": "cycling",
         "sub_sport": "generic",
     }
     encoder.on_mesg(nums["LAP"], {"message_index": 0, **common_summary})
@@ -228,6 +257,98 @@ def write_fit(rows: list[TelemetryRow], path: Path, metadata: dict[str, Any], na
 
     path.write_bytes(encoder.close())
     validate_fit(path, rows, warnings)
+
+
+def write_fit_record(encoder: Encoder, nums: dict[str, int], row: TelemetryRow) -> None:
+    record: dict[str, Any] = {
+        "timestamp": row.timestamp_utc,
+        "position_lat": degrees_to_semicircles(row.latitude),
+        "position_long": degrees_to_semicircles(row.longitude),
+        "distance": row.distance_m,
+        "speed": fit_speed(row.speed_m_s),
+        "enhanced_speed": nonnegative(row.speed_m_s),
+        "altitude": fit_altitude(row.altitude_m),
+        "enhanced_altitude": fit_altitude(row.altitude_m),
+        "activity_type": "cycling",
+        "power": fdm_legacy_power(row),
+    }
+    optional_fields = {
+        "cadence": fdm_cadence(row),
+        "heart_rate": fdm_heart_rate(row),
+        "vertical_oscillation": fdm_vertical_oscillation(row),
+        "stance_time": fdm_recorded_3d_speed_kmh(row),
+        "stance_time_percent": fdm_altitude(row),
+    }
+    record.update({key: value for key, value in optional_fields.items() if value is not None})
+    encoder.on_mesg(nums["RECORD"], record)
+
+
+def write_aviation_attitude(encoder: Encoder, nums: dict[str, int], group: list[TelemetryRow]) -> None:
+    system_time: list[int] = []
+    pitch: list[float] = []
+    roll: list[float] = []
+    track: list[float] = []
+    for row in group:
+        pitch_value = extra_float(row, "angle_theta")
+        roll_value = extra_float(row, "angle_phi")
+        track_value = normalized_track(extra_float(row, "angle_psi"))
+        if pitch_value is None or roll_value is None or track_value is None:
+            continue
+        system_time.append(row.time_ms)
+        pitch.append(pitch_value)
+        roll.append(roll_value)
+        track.append(track_value)
+    if not system_time:
+        return
+    encoder.on_mesg(
+        nums["AVIATION_ATTITUDE"],
+        {
+            "timestamp": group[0].timestamp_utc.replace(microsecond=0),
+            "system_time": system_time,
+            "pitch": pitch,
+            "roll": roll,
+            "track": track,
+        },
+    )
+
+
+def write_obdii_data(encoder: Encoder, nums: dict[str, int], row: TelemetryRow) -> None:
+    time_ms = row.time_ms
+    speed = fdm_pid13_vehicle_speed(row)
+    if speed is not None:
+        encoder.on_mesg(
+            nums["OBDII_DATA"],
+            {
+                "timestamp": row.timestamp_utc.replace(microsecond=0),
+                "system_time": [time_ms, None],
+                "pid": OBD_PID_VEHICLE_SPEED,
+                "raw_data": [speed, 255],
+            },
+        )
+
+    distance = fdm_pid12_distance_from_home(row)
+    if distance is not None:
+        encoder.on_mesg(
+            nums["OBDII_DATA"],
+            {
+                "timestamp": row.timestamp_utc.replace(microsecond=0),
+                "system_time": [time_ms, time_ms],
+                "pid": OBD_PID_DISTANCE_FROM_HOME,
+                "raw_data": encode_u16_obd_value(round(distance * 4.0)),
+            },
+        )
+
+    altitude = fdm_altitude(row)
+    if altitude is not None:
+        encoder.on_mesg(
+            nums["OBDII_DATA"],
+            {
+                "timestamp": row.timestamp_utc.replace(microsecond=0),
+                "system_time": [time_ms, time_ms],
+                "pid": OBD_PID_ALTITUDE,
+                "raw_data": encode_u16_obd_value(round(altitude * 20.0)),
+            },
+        )
 
 
 def validate_fit(path: Path, rows: list[TelemetryRow], warnings: list[str]) -> None:
@@ -279,6 +400,22 @@ def write_manifest(
         "end_time_utc": iso_z(rows[-1].timestamp_utc),
         "total_distance_m": rows[-1].distance_m,
         "total_distance_mi": rows[-1].distance_m / 1609.344,
+        "fit_distance_source": "standard FIT distance field; FDM legacy carrier fields are compatibility shims",
+        "fdm_compatibility": {
+            "enabled": True,
+            "record_carriers": [
+                "activity_type",
+                "cadence",
+                "heart_rate",
+                "vertical_oscillation",
+                "stance_time",
+                "stance_time_percent",
+                "power",
+            ],
+            "message_carriers": ["file_creator", "timestamp_correlation", "aviation_attitude", "obdii_data"],
+            "legacy_power_distance_limit_m": LEGACY_POWER_DISTANCE_LIMIT_M,
+            "obd_pid12_distance_from_home_limit_m": FDM_PID12_DISTANCE_LIMIT_M,
+        },
         "outputs": [str(path) for path in output_files],
         "warnings": warnings,
     }
@@ -292,6 +429,7 @@ def write_manifest(
         f"Samples exported: {len(rows)}",
         f"Rows skipped: {skipped_rows}",
         f"Distance: {rows[-1].distance_m:.1f} m / {rows[-1].distance_m / 1609.344:.3f} mi",
+        "Distance source: standard FIT distance field; FDM legacy carrier fields are compatibility shims",
         "",
         "Files:",
     ]
@@ -302,8 +440,141 @@ def write_manifest(
     readme_path.write_text("\n".join(readme_lines) + "\n", encoding="utf-8")
 
 
+def group_rows_by_second(rows: list[TelemetryRow]) -> list[list[TelemetryRow]]:
+    groups: list[list[TelemetryRow]] = []
+    current_key: datetime | None = None
+    for row in rows:
+        key = row.timestamp_utc.replace(microsecond=0)
+        if current_key != key:
+            groups.append([])
+            current_key = key
+        groups[-1].append(row)
+    return groups
+
+
+def add_fdm_compat_warnings(rows: list[TelemetryRow], warnings: list[str]) -> None:
+    append_unique(
+        warnings,
+        "FIT includes FDM-compatible carrier fields; standard FIT distance remains the authoritative long-distance field",
+    )
+    if any(row.distance_m > LEGACY_POWER_DISTANCE_LIMIT_M for row in rows):
+        append_unique(
+            warnings,
+            "Legacy FDM power-as-distance field saturated above 65534 m; standard FIT distance continues normally",
+        )
+    if any((row.distance_from_home_m or 0.0) > FDM_PID12_DISTANCE_LIMIT_M for row in rows):
+        append_unique(
+            warnings,
+            "Legacy FDM OBD PID 12 distance-from-home field saturated near 16384 m to avoid wrap/reset",
+        )
+
+
+def append_unique(items: list[str], value: str) -> None:
+    if value not in items:
+        items.append(value)
+
+
+def fdm_cadence(row: TelemetryRow) -> int | None:
+    return clamp_int(extra_int(row, "battery_level"), 0, 255)
+
+
+def fdm_heart_rate(row: TelemetryRow) -> int | None:
+    wifi = extra_int(row, "wifi_signal")
+    if wifi is None:
+        return None
+    return clamp_int(abs(wifi), 0, 255)
+
+
+def fdm_vertical_oscillation(row: TelemetryRow) -> float | None:
+    satellites = extra_int(row, "product_gps_sv_number")
+    if satellites is None:
+        return None
+    return float(max(0, satellites) * 10)
+
+
+def fdm_recorded_3d_speed_kmh(row: TelemetryRow) -> float | None:
+    if row.speed_m_s is None:
+        return None
+    return max(0.0, row.speed_m_s * 3.6)
+
+
+def fdm_altitude(row: TelemetryRow) -> float | None:
+    if row.altitude_m is None:
+        return None
+    return max(0.0, row.altitude_m)
+
+
+def fdm_legacy_power(row: TelemetryRow) -> int:
+    return clamp_int(round(row.distance_m), 0, int(LEGACY_POWER_DISTANCE_LIMIT_M)) or 0
+
+
+def fdm_pid13_vehicle_speed(row: TelemetryRow) -> int | None:
+    pitot_speed = extra_float(row, "pitot_speed")
+    if pitot_speed is None:
+        return None
+    return clamp_int(round(max(0.0, pitot_speed) * 3.6), 0, 255)
+
+
+def fdm_pid12_distance_from_home(row: TelemetryRow) -> float | None:
+    if row.distance_from_home_m is None:
+        return None
+    return min(max(0.0, row.distance_from_home_m), FDM_PID12_DISTANCE_LIMIT_M)
+
+
+def encode_u16_obd_value(value: int) -> list[int]:
+    clamped = clamp_int(value, 0, 65_535) or 0
+    return [(clamped >> 8) & 255, clamped & 255]
+
+
+def normalized_track(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return value % (math.pi * 2.0)
+
+
+def extra_int(row: TelemetryRow, key: str) -> int | None:
+    value = row.extras.get(key)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def extra_float(row: TelemetryRow, key: str) -> float | None:
+    value = row.extras.get(key)
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(result) or math.isinf(result):
+        return None
+    return result
+
+
+def clamp_int(value: int | None, low: int, high: int) -> int | None:
+    if value is None:
+        return None
+    return min(max(value, low), high)
+
+
+def _csv_value(value: Any, precision: int | None = None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and precision is not None:
+        return f"{value:.{precision}f}"
+    return str(value)
+
+
 def degrees_to_semicircles(degrees: float) -> int:
     return int(round(degrees * (2**31) / 180.0))
+
+
+def fit_local_timestamp(value: datetime) -> int:
+    return max(0, int((value.astimezone(timezone.utc) - FIT_EPOCH).total_seconds()))
 
 
 def fit_speed(value: float | None) -> float | None:
